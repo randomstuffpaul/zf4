@@ -400,7 +400,10 @@ struct fg_chip {
 	struct ttf		ttf;
 	struct mutex		bus_lock;
 	struct mutex		sram_rw_lock;
+	struct mutex		batt_avg_lock;
 	struct mutex		charge_full_lock;
+	struct mutex		charge_status_lock;
+	spinlock_t		suspend_lock;
 	u32			batt_soc_base;
 	u32			batt_info_base;
 	u32			mem_if_base;
@@ -427,6 +430,7 @@ struct fg_chip {
 	bool			battery_missing;
 	bool			fg_restarting;
 	bool			charge_full;
+	bool			reporting_charge_full;
 	bool			recharge_soc_adjusted;
 	bool			ki_coeff_dischg_en;
 	bool			esr_fcc_ctrl_en;
@@ -434,12 +438,16 @@ struct fg_chip {
 	bool			esr_flt_cold_temp_en;
 	bool			slope_limit_en;
 	bool			use_ima_single_mode;
+	bool			suspended;
 	struct completion	soc_update;
 	struct completion	soc_ready;
 	struct delayed_work	profile_load_work;
 	struct work_struct	status_change_work;
+	struct work_struct	cycle_count_work;
 	struct delayed_work	ttf_work;
 	struct delayed_work	sram_dump_work;
+	struct fg_circ_buf	ibatt_circ_buf;
+	struct fg_circ_buf	vbatt_circ_buf;
 };
 
 /* Debugfs data structures are below */

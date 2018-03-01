@@ -49,6 +49,8 @@
 #include <linux/cpuset.h>
 #include <linux/vmpressure.h>
 #include <linux/zcache.h>
+#include <linux/slab.h>
+#include <linux/kmod.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/almk.h>
@@ -61,6 +63,8 @@
 
 #define CREATE_TRACE_POINTS
 #include "trace/lowmemorykiller.h"
+
+struct work_struct __dumpthread_work;
 
 static uint32_t lowmem_debug_level = 1;
 static short lowmem_adj[6] = {
@@ -79,7 +83,7 @@ static int lowmem_minfree[6] = {
 static int lowmem_minfree_size = 4;
 static int lmk_fast_run = 1;
 
-static unsigned long lowmem_deathpending_timeout;
+//static unsigned long lowmem_deathpending_timeout;
 
 #define lowmem_print(level, x...)			\
 	do {						\
@@ -217,7 +221,7 @@ static int test_task_flag(struct task_struct *p, int flag)
 	return 0;
 }
 
-static int test_task_state(struct task_struct *p, int state)
+/*static int test_task_state(struct task_struct *p, int state)
 {
 	struct task_struct *t;
 
@@ -231,7 +235,7 @@ static int test_task_state(struct task_struct *p, int state)
 	}
 
 	return 0;
-}
+}*/
 
 static DEFINE_MUTEX(scan_mutex);
 
@@ -404,8 +408,45 @@ void tune_lmk_param(int *other_free, int *other_file, struct shrink_control *sc)
 	}
 }
 
+#define DTaskMax 4
+struct task_node {
+     struct list_head node;
+     struct task_struct *pTask;
+};
+enum EListAllocate {
+	EListAllocate_Init,
+	EListAllocate_Head,
+	EListAllocate_Body,
+	EListAllocate_Tail
+};
+static int list_insert(struct task_struct *pTask, struct list_head *pPosition)
+{
+	int nResult = 0;
+	struct task_node *pTaskNode;
+	pTaskNode = kmalloc(sizeof(struct task_node), GFP_ATOMIC);
+	if (pTaskNode) {
+		pTaskNode->pTask = pTask;
+		list_add(&pTaskNode->node, pPosition);
+		nResult = 1;
+	}
+	return nResult;
+}
+static void list_reset(struct list_head *pList)
+{
+	struct task_node *pTaskIterator;
+	struct task_node *pTaskNext;
+	list_for_each_entry_safe(pTaskIterator, pTaskNext, pList, node) {
+		list_del(&pTaskIterator->node);
+		kfree(pTaskIterator);
+	}
+}
+
 static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 {
+	LIST_HEAD(ListHead);
+	int nTaskNum = 0;
+	struct task_node *pTaskIterator;
+	struct task_node *pTaskNext;
 	struct task_struct *tsk;
 	struct task_struct *selected = NULL;
 	unsigned long rem = 0;
@@ -419,6 +460,9 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 	int array_size = ARRAY_SIZE(lowmem_adj);
 	int other_free;
 	int other_file;
+	short previous_min_score_adj = OOM_SCORE_ADJ_MAX + 1;
+	bool bIsALMK = false;
+	int nTaskMax = DTaskMax;
 
 	if (!mutex_trylock(&scan_mutex))
 		return 0;
@@ -448,7 +492,11 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 		}
 	}
 
+	previous_min_score_adj = min_score_adj;
 	ret = adjust_minadj(&min_score_adj);
+	if (previous_min_score_adj != min_score_adj) {
+		bIsALMK = true;
+	}
 
 	lowmem_print(3, "lowmem_scan %lu, %x, ofree %d %d, ma %hd\n",
 			sc->nr_to_scan, sc->gfp_mask, other_free,
@@ -464,6 +512,29 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 
 	selected_oom_score_adj = min_score_adj;
 
+	// if aLMK, kill one app at a time, others, check the min_score_adj, the lower the memory, the more the apps to kill
+	/* Record adj in ProcessList.java to be used for Android N
+		1001 : UNKNOWN_ADJ
+		906 : CACHED_APP_MAX_ADJ
+		900 : CACHED_APP_MIN_ADJ
+		700 : PREVIOUS_APP_ADJ
+		300 : BACKUP_APP_ADJ
+		200 : PERCEPTIBLE_APP_ADJ
+		100 : VISIBLE_APP_ADJ
+	*/
+	if(bIsALMK)
+		nTaskMax = 2;
+	else if(min_score_adj >= 906)
+		nTaskMax = 2;
+	else if(min_score_adj >= 900)
+		nTaskMax = 3;		
+	else if(min_score_adj >= 300)
+		nTaskMax = 4;	
+	else if(min_score_adj >= 200)
+		nTaskMax = 5;
+	else
+		nTaskMax = 6;
+
 	rcu_read_lock();
 	for_each_process(tsk) {
 		struct task_struct *p;
@@ -476,19 +547,15 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 		if (test_task_flag(tsk, TIF_MM_RELEASED))
 			continue;
 
-		if (time_before_eq(jiffies, lowmem_deathpending_timeout)) {
-			if (test_task_flag(tsk, TIF_MEMDIE)) {
-				rcu_read_unlock();
-				mutex_unlock(&scan_mutex);
-				return 0;
-			}
-		}
+		if (test_task_flag(tsk, TIF_MEMDIE)) 
+			continue;
 
 		p = find_lock_task_mm(tsk);
 		if (!p)
 			continue;
 
 		oom_score_adj = p->signal->oom_score_adj;
+
 		if (oom_score_adj < min_score_adj) {
 			task_unlock(p);
 			continue;
@@ -497,31 +564,97 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 		task_unlock(p);
 		if (tasksize <= 0)
 			continue;
-		if (selected) {
-			if (oom_score_adj < selected_oom_score_adj)
-				continue;
-			if (oom_score_adj == selected_oom_score_adj &&
-			    tasksize <= selected_tasksize)
-				continue;
+		if (nTaskNum == 0) {
+			if (list_insert(p, &ListHead))
+				nTaskNum++;
+			else
+				lowmem_print(1, "Unable to allocate memory (%d)\n", EListAllocate_Init);
+		} else {
+			/* Find the node index that fit for current task */
+			int nError = 0;
+			struct list_head *pInsertPos = NULL;
+			struct task_node *pTaskSearchIterator;
+			struct task_node *pTaskSearchNext;
+			list_for_each_entry_safe(pTaskSearchIterator, pTaskSearchNext, &ListHead, node) {
+				int nTargeteAdj = 0;
+				int nTargetSize = 0;
+				struct task_struct *pTask;
+				pTask = pTaskSearchIterator->pTask;
+				if (!pTask)
+					continue;
+				task_lock(pTask);
+				if (pTask->signal)
+					nTargeteAdj = pTask->signal->oom_score_adj;
+				if (pTask->mm)
+					nTargetSize = get_mm_rss(pTask->mm);
+				task_unlock(pTask);
+				if (oom_score_adj < nTargeteAdj) {
+					break;
+				} else if (oom_score_adj == nTargeteAdj) {
+					if (tasksize <= nTargetSize) {
+						break;
+					}
+				}
+			}
+			/* Determine the insert position */
+			if (&pTaskSearchIterator->node == &ListHead) {
+				/* Add node to tail */
+				pInsertPos = ListHead.prev;
+				nError = EListAllocate_Tail;
+			} else if (&pTaskSearchIterator->node == ListHead.next) {
+				if (nTaskNum < nTaskMax) {
+					/* Add node to head */
+					pInsertPos = &ListHead;
+					nError = EListAllocate_Head;
+				}
+			} else {
+				/* Insert node to the list */
+				pInsertPos = pTaskSearchIterator->node.prev;
+				nError = EListAllocate_Body;
+			}
+			/* Perform insertion */
+			if (pInsertPos) {
+				if (list_insert(p, pInsertPos))
+					nTaskNum++;
+				else
+					lowmem_print(1, "Unable to allocate memory (%d)\n", nError);
+			}
+			/* Delete node if the kept tasks exceed the limit */
+			if (nTaskNum > nTaskMax) {
+				struct task_node *pDeleteNode = list_entry((ListHead).next, struct task_node, node);
+				list_del((ListHead).next);
+				kfree(pDeleteNode);
+				nTaskNum--;
+			}
 		}
-		selected = p;
-		selected_tasksize = tasksize;
-		selected_oom_score_adj = oom_score_adj;
-		lowmem_print(3, "select '%s' (%d), adj %hd, size %d, to kill\n",
-			     p->comm, p->pid, oom_score_adj, tasksize);
 	}
-	if (selected) {
+	//lowmem_print(1, "bIsALMK=%d, min_score_adj=%d, nTaskNum=%d\n",bIsALMK,min_score_adj,nTaskNum);
+	list_for_each_entry_safe_reverse(pTaskIterator, pTaskNext, &ListHead, node) {
 		long cache_size, cache_limit, free;
-
-		if (test_task_flag(selected, TIF_MEMDIE) &&
-		    (test_task_state(selected, TASK_UNINTERRUPTIBLE))) {
-			lowmem_print(2, "'%s' (%d) is already killed\n",
-				     selected->comm,
-				     selected->pid);
-			rcu_read_unlock();
-			mutex_unlock(&scan_mutex);
-			return 0;
+		selected = pTaskIterator->pTask;
+		if (!selected)
+			continue;
+		task_lock(selected);
+		if (test_tsk_thread_flag(selected, TIF_MEMDIE)) {
+			task_unlock(selected);
+			continue;
 		}
+		if (selected->signal)
+			selected_oom_score_adj = selected->signal->oom_score_adj;
+		if (selected_oom_score_adj < min_score_adj) {
+			lowmem_print(1, "lowmem:Skip killing '%s' (%d), adj %hd is lower than min_score_adj %d now\n", selected->comm, selected->pid, selected_oom_score_adj, min_score_adj);
+			task_unlock(selected);
+			continue;
+        	}
+		if(selected->pid == current->pid)
+	      {
+			lowmem_print(1, "lowmem:Skip killing '%s' (adj=%d), pid=%d itself\n", selected->comm, selected_oom_score_adj, selected->pid);
+			task_unlock(selected);
+			continue;
+		}
+		if (selected->mm)
+			selected_tasksize = get_mm_rss(selected->mm);
+		task_unlock(selected);
 
 		task_lock(selected);
 		send_sig(SIGKILL, selected, 0);
@@ -533,6 +666,7 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 		if (selected->mm)
 			mark_oom_victim(selected);
 		task_unlock(selected);
+
 		cache_size = other_file * (long)(PAGE_SIZE / 1024);
 		cache_limit = minfree * (long)(PAGE_SIZE / 1024);
 		free = other_free * (long)(PAGE_SIZE / 1024);
@@ -564,27 +698,23 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 			     (long)zcache_pages() * (long)(PAGE_SIZE / 1024),
 			     sc->gfp_mask);
 
-		if (lowmem_debug_level >= 2 && selected_oom_score_adj == 0) {
+		if (selected_oom_score_adj == 0) {
 			show_mem(SHOW_MEM_FILTER_NODES);
 			dump_tasks(NULL, NULL);
 		}
 
-		lowmem_deathpending_timeout = jiffies + HZ;
 		rem += selected_tasksize;
-		rcu_read_unlock();
-		/* give the system time to free up the memory */
-		msleep_interruptible(20);
+
 		trace_almk_shrink(selected_tasksize, ret,
 				  other_free, other_file,
 				  selected_oom_score_adj);
-	} else {
-		trace_almk_shrink(1, ret, other_free, other_file, 0);
-		rcu_read_unlock();
 	}
+	list_reset(&ListHead);
+	rcu_read_unlock();
+	mutex_unlock(&scan_mutex);
 
 	lowmem_print(4, "lowmem_scan %lu, %x, return %lu\n",
 		     sc->nr_to_scan, sc->gfp_mask, rem);
-	mutex_unlock(&scan_mutex);
 	return rem;
 }
 
@@ -595,10 +725,26 @@ static struct shrinker lowmem_shrinker = {
 	.flags = SHRINKER_LMK
 };
 
+void dumpthread_func(struct work_struct *work)
+{
+	int ret = -1;
+	char cmdpath[] = "/system/vendor/bin/recvkernelevt";
+	char *argv[8] = {cmdpath, "dumpbusythread",NULL};
+	char *envp[] = {"HOME=/", "PATH=/sbin:/system/bin:/system/sbin:/vendor/bin", NULL};
+	printk("[Debug+++] dumpthread  on userspace\n");
+	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+	printk("[Debug---] dumpthread  on userspace, ret = %d\n", ret);
+
+	return;
+}
+
 static int __init lowmem_init(void)
 {
 	register_shrinker(&lowmem_shrinker);
 	vmpressure_notifier_register(&lmk_vmpr_nb);
+
+	INIT_WORK(&__dumpthread_work, dumpthread_func);
+
 	return 0;
 }
 device_initcall(lowmem_init);
